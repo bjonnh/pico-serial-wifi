@@ -9,6 +9,7 @@ set(PICO_CYW43_ARCH_POLL 0)
 set(DEBUG 1)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3")
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O3")
+set(PICO_BOARD pico_w)
 pico_sdk_init()
 
 add_executable(udp_server

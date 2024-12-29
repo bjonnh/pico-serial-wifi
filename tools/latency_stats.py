@@ -41,13 +41,11 @@ def measure_throughput(sender, receiver, chunk_size=1024, duration=1.0):
 
     while (time.perf_counter() - start_time) < duration:
         sender.write(test_data)
-        sender.flush()
 
         received = receiver.read(chunk_size)
         if received:
             total_bytes += len(received)
 
-        time.sleep(0.001)
 
     while receiver.in_waiting:
         received = receiver.read(receiver.in_waiting)
@@ -104,7 +102,6 @@ def main():
             s2c_latencies.append(s2c_lat)
             if not integrity:
                 integrity_failures += 1
-            time.sleep(0.001)
 
         print_stats(c2s_latencies, "Client to Server")
         print_stats(s2c_latencies, "Server to Client")

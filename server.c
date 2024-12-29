@@ -1,13 +1,13 @@
 #include <stdio.h>
 #include "pico/stdlib.h"
 #include "pico/cyw43_arch.h"
-#include "lwip/tcp.h"
+#include "lwip/udp.h"
 #include "dhcpserver.h"
 #include "dnsserver.h"
 #include "tusb.h"
 
-#define TCP_PORT 80
-#define TX_BUFFER_SIZE 512
+#define UDP_PORT 80
+#define TX_BUFFER_SIZE 32
 
 #ifdef DEBUG_PRINTF
 #define DEBUG_PRINT(...) printf(__VA_ARGS__)
@@ -15,109 +15,79 @@
 #define DEBUG_PRINT(...)
 #endif
 
-typedef struct TCP_SERVER_T_ {
-    struct tcp_pcb *server_pcb;
+typedef struct UDP_SERVER_T_ {
+    struct udp_pcb *udp_pcb;
     bool complete;
     ip_addr_t gw;
-    struct tcp_pcb *client_pcb;
     uint8_t tx_buffer[TX_BUFFER_SIZE];
     uint16_t tx_len;
-} TCP_SERVER_T;
+    // Store last client info
+    ip_addr_t client_addr;
+    u16_t client_port;
+    bool client_active;
+} UDP_SERVER_T;
 
-static TCP_SERVER_T* g_state = NULL;
+static UDP_SERVER_T* g_state = NULL;
 
-static err_t tcp_server_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err) {
-    TCP_SERVER_T *state = (TCP_SERVER_T*)arg;
+static void udp_server_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p,
+                          const ip_addr_t *addr, u16_t port) {
+    UDP_SERVER_T *state = (UDP_SERVER_T*)arg;
+    if (!p) return;
 
-    if (!p) {
-        state->client_pcb = NULL;
-        return ERR_OK;
-    }
+    // Store client info for replies
+    ip_addr_copy(state->client_addr, *addr);
+    state->client_port = port;
+    state->client_active = true;
 
     uint8_t *data = (uint8_t*)p->payload;
     for (uint16_t i = 0; i < p->len; i++) {
         putchar(data[i]);
     }
 
-    DEBUG_PRINT("TCP Received Data (length: %d): %s\n", p->len, (char*)p->payload);
-
-    tcp_recved(pcb, p->tot_len);
+    DEBUG_PRINT("UDP Received Data (length: %d): %s\n", p->len, (char*)p->payload);
     pbuf_free(p);
-    return ERR_OK;
 }
 
-static err_t tcp_server_sent(void *arg, struct tcp_pcb *tpcb, u16_t len) {
-    TCP_SERVER_T *state = (TCP_SERVER_T*)arg;
-    state->tx_len = 0;
-    DEBUG_PRINT("Data sent successfully\n");
-    return ERR_OK;
-}
+static bool udp_server_open(void *arg) {
+    UDP_SERVER_T *state = (UDP_SERVER_T*)arg;
 
-static err_t tcp_server_accept(void *arg, struct tcp_pcb *client_pcb, err_t err) {
-    TCP_SERVER_T *state = (TCP_SERVER_T*)arg;
+    state->udp_pcb = udp_new();
+    if (!state->udp_pcb) return false;
 
-    if (err != ERR_OK || client_pcb == NULL) {
-        return ERR_VAL;
-    }
-
-    state->client_pcb = client_pcb;
-    state->tx_len = 0;
-
-    DEBUG_PRINT("Client connected\n");
-
-    tcp_arg(client_pcb, state);
-    tcp_recv(client_pcb, tcp_server_recv);
-    tcp_sent(client_pcb, tcp_server_sent);
-
-    tcp_nagle_disable(client_pcb);
-
-    return ERR_OK;
-}
-
-static bool tcp_server_open(void *arg) {
-    TCP_SERVER_T *state = (TCP_SERVER_T*)arg;
-
-    struct tcp_pcb *pcb = tcp_new_ip_type(IPADDR_TYPE_ANY);
-    if (!pcb) return false;
-
-    err_t err = tcp_bind(pcb, IP_ANY_TYPE, TCP_PORT);
-    if (err) return false;
-
-    state->server_pcb = tcp_listen_with_backlog(pcb, 1);
-    if (!state->server_pcb) {
-        if (pcb) tcp_close(pcb);
+    err_t err = udp_bind(state->udp_pcb, IP_ANY_TYPE, UDP_PORT);
+    if (err) {
+        udp_remove(state->udp_pcb);
         return false;
     }
 
-    tcp_arg(state->server_pcb, state);
-    tcp_accept(state->server_pcb, tcp_server_accept);
-
-    DEBUG_PRINT("TCP Server opened on port %d\n", TCP_PORT);
+    udp_recv(state->udp_pcb, udp_server_recv, state);
+    DEBUG_PRINT("UDP Server opened on port %d\n", UDP_PORT);
 
     return true;
 }
 
-static void try_send_data(TCP_SERVER_T *state) {
-    if (state->tx_len > 0 && state->client_pcb) {
+static void try_send_data(UDP_SERVER_T *state) {
+    if (state->tx_len > 0 && state->client_active) {
         cyw43_arch_lwip_begin();
-        err_t err = tcp_write(state->client_pcb, state->tx_buffer, state->tx_len, TCP_WRITE_FLAG_COPY);
-        if (err == ERR_OK) {
-            err = tcp_output(state->client_pcb);
+        struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, state->tx_len, PBUF_RAM);
+        if (p) {
+            memcpy(p->payload, state->tx_buffer, state->tx_len);
+            // Send to last known client
+            err_t err = udp_sendto(state->udp_pcb, p, &state->client_addr, state->client_port);
             if (err == ERR_OK) {
-                DEBUG_PRINT("Data sent: %.*s\n", state->tx_len, state->tx_buffer);
-                state->tx_len = 0;
+                DEBUG_PRINT("Data sent to client: %.*s\n", state->tx_len, state->tx_buffer);
             } else {
-                DEBUG_PRINT("Failed to flush the TCP output\n");
+                DEBUG_PRINT("UDP send error: %d\n", err);
             }
-        } else {
-            DEBUG_PRINT("TCP write error: %d\n", err);
+            pbuf_free(p);
+            state->tx_len = 0;
         }
         cyw43_arch_lwip_end();
     }
 }
 
 static void check_usb_rx() {
-    if (!g_state || !g_state->client_pcb) return;
+    if (!g_state) return;
 
     while (g_state->tx_len < TX_BUFFER_SIZE) {
         int c = getchar_timeout_us(0);
@@ -147,16 +117,13 @@ int main() {
         return 1;
     }
 
-    TCP_SERVER_T *state = calloc(1, sizeof(TCP_SERVER_T));
+    UDP_SERVER_T *state = calloc(1, sizeof(UDP_SERVER_T));
     if (!state) return 1;
 
     g_state = state;
+    state->client_active = false;
 
     cyw43_arch_enable_ap_mode("PicoAP", "12345678", CYW43_AUTH_WPA2_AES_PSK);
-    cyw43_wifi_pm(&cyw43_state, CYW43_NO_POWERSAVE_MODE);
-
-
-    // Increase WiFi power
     cyw43_wifi_pm(&cyw43_state, CYW43_NO_POWERSAVE_MODE);
 
     ip4_addr_t mask;
@@ -169,13 +136,13 @@ int main() {
     dns_server_t dns_server;
     dns_server_init(&dns_server, &state->gw);
 
-    if (!tcp_server_open(state)) return 1;
+    if (!udp_server_open(state)) return 1;
 
     DEBUG_PRINT("Server started\n");
 
     while (!state->complete) {
         check_usb_rx();
-        cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, state->client_pcb != NULL);
+        cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, state->client_active);
         tight_loop_contents();
     }
 
