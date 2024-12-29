@@ -6,7 +6,7 @@
 
 #define SERVER_IP "192.168.4.1"
 #define SERVER_PORT 80
-#define TX_BUFFER_SIZE 32
+#define TX_BUFFER_SIZE 8192
 
 #ifdef DEBUG
 #define DEBUG_PRINTF(fmt, ...) printf(fmt, ##__VA_ARGS__)
@@ -32,6 +32,8 @@ static void udp_client_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p,
         putchar(data[i]);
     }
 
+    stdio_flush();
+    
     DEBUG_PRINTF("Received %d bytes: %.*s\n", p->len, p->len, (char*)p->payload);
     pbuf_free(p);
 }
@@ -59,7 +61,7 @@ static void check_usb_rx() {
     if (!g_state || !g_state->pcb) return;
 
     while (g_state->tx_len < TX_BUFFER_SIZE) {
-        int c = getchar_timeout_us(0);
+        int c = getchar_timeout_us(10);
         if (c == PICO_ERROR_TIMEOUT) break;
 
         g_state->tx_buffer[g_state->tx_len++] = (uint8_t)c;
@@ -68,7 +70,9 @@ static void check_usb_rx() {
     if (g_state->tx_len > 0) {
         DEBUG_PRINTF("USB RX: Buffer length = %d\n", g_state->tx_len);
         try_send_data(g_state);
+        check_usb_rx();
     }
+
 }
 
 int main() {

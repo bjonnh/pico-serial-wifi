@@ -4,6 +4,7 @@ import numpy as np
 from tqdm import tqdm
 import statistics
 import argparse
+import os
 
 def setup_serial_ports(client_port, server_port):
     print(f"Client port: {client_port}")
@@ -41,11 +42,13 @@ def measure_throughput(sender, receiver, chunk_size=1024, duration=1.0):
 
     while (time.perf_counter() - start_time) < duration:
         sender.write(test_data)
+        sender.flush()
 
         received = receiver.read(chunk_size)
         if received:
             total_bytes += len(received)
 
+        time.sleep(0.001)
 
     while receiver.in_waiting:
         received = receiver.read(receiver.in_waiting)
@@ -54,6 +57,49 @@ def measure_throughput(sender, receiver, chunk_size=1024, duration=1.0):
     elapsed_time = time.perf_counter() - start_time
     throughput = (total_bytes * 8) / (elapsed_time * 1000)  # kbps
     return throughput, total_bytes, elapsed_time
+
+def transfer_large_data(sender, receiver, data):
+    chunk_size = 1024
+    total_sent = 0
+    received_data = bytearray()
+
+    start_time = time.perf_counter()
+
+    # Send data in chunks
+    while total_sent < len(data):
+        chunk = data[total_sent:total_sent + chunk_size]
+        sender.write(chunk)
+        sender.flush()
+        total_sent += len(chunk)
+        time.sleep(0.01)
+
+        while receiver.in_waiting:
+            received_data.extend(receiver.read(receiver.in_waiting))
+
+    # Wait for any remaining data
+    # Read any remaining data
+    while receiver.in_waiting:
+        received_data.extend(receiver.read(receiver.in_waiting))
+        time.sleep(1)
+
+    elapsed_time = time.perf_counter() - start_time - 1 # We remove the 1 second sleep
+    integrity = (data == received_data)
+    # Check length and print if it doesn't match
+    if len(data) != len(received_data):
+        print(f"Data length mismatch: {len(data)} sent vs {len(received_data)} received")
+    else:
+        diff_count = sum([1 for i in range(len(data)) if data[i] != received_data[i]])
+
+        if diff_count > 0:
+            print(f"Data integrity check failed: {diff_count} bytes are different")
+
+    throughput = (len(received_data) * 8) / (elapsed_time * 1000)  # kbps
+
+    return elapsed_time, throughput, integrity
+
+def flush(serial_port):
+    while serial_port.in_waiting:
+        serial_port.read(serial_port.in_waiting)
 
 def print_stats(latencies, direction):
     min_lat = min(latencies)
@@ -75,22 +121,25 @@ def print_stats(latencies, direction):
 def main():
     parser = argparse.ArgumentParser(description='Measure serial port latency and throughput')
     parser.add_argument('--client', type=str, default='/dev/ttyACM1',
-                      help='Client serial port (default: /dev/ttyACM1)')
+                        help='Client serial port (default: /dev/ttyACM1)')
     parser.add_argument('--server', type=str, default='/dev/ttyACM2',
-                      help='Server serial port (default: /dev/ttyACM2)')
+                        help='Server serial port (default: /dev/ttyACM2)')
     parser.add_argument('--tests', type=int, default=1000,
-                      help='Number of latency tests to run (default: 1000)')
+                        help='Number of latency tests to run (default: 1000)')
     parser.add_argument('--chunk-size', type=int, default=1024,
-                      help='Chunk size for throughput test in bytes (default: 1024)')
+                        help='Chunk size for throughput test in bytes (default: 1024)')
     parser.add_argument('--throughput-duration', type=float, default=1.0,
-                      help='Duration of each throughput test in seconds (default: 1.0)')
+                        help='Duration of each throughput test in seconds (default: 1.0)')
+    parser.add_argument('--large-transfer', action='store_true',
+                        help='Perform 128KB random data transfer test')
 
     args = parser.parse_args()
-
     client, server = setup_serial_ports(args.client, args.server)
 
     try:
         # Latency Tests
+        flush(client)
+        flush(server)
         print("\n=== Latency Tests ===")
         c2s_latencies = []
         s2c_latencies = []
@@ -102,6 +151,9 @@ def main():
             s2c_latencies.append(s2c_lat)
             if not integrity:
                 integrity_failures += 1
+        time.sleep(1)
+        flush(client)
+        flush(server)
 
         print_stats(c2s_latencies, "Client to Server")
         print_stats(s2c_latencies, "Server to Client")
@@ -115,12 +167,9 @@ def main():
         print(f"Throughput: {c2s_throughput:.2f} kbps")
         print(f"Bytes transferred: {c2s_bytes:,}")
         print(f"Time elapsed: {c2s_time:.2f} seconds")
-
-        client.reset_input_buffer()
-        client.reset_output_buffer()
-        server.reset_input_buffer()
-        server.reset_output_buffer()
-        time.sleep(0.2)
+        time.sleep(1)
+        flush(client)
+        flush(server)
 
         print("\nServer to Client:")
         s2c_throughput, s2c_bytes, s2c_time = measure_throughput(
@@ -128,6 +177,34 @@ def main():
         print(f"Throughput: {s2c_throughput:.2f} kbps")
         print(f"Bytes transferred: {s2c_bytes:,}")
         print(f"Time elapsed: {s2c_time:.2f} seconds")
+        print("\n=== 128KB Random Data Transfer Test ===")
+        # Generate random data
+        random_data = os.urandom(128 * 1024)
+
+        time.sleep(1)
+        flush(client)
+        flush(server)
+
+        print("\nClient to Server:")
+        time_c2s, throughput_c2s, integrity_c2s = transfer_large_data(client, server, random_data)
+        print(f"Time: {time_c2s:.2f} seconds")
+        print(f"Throughput: {throughput_c2s:.2f} kbps")
+        print(f"Data integrity: {'OK' if integrity_c2s else 'FAILED'}")
+
+        time.sleep(1)
+        flush(client)
+        flush(server)
+
+        print("\nServer to Client:")
+        time_s2c, throughput_s2c, integrity_s2c = transfer_large_data(server, client, random_data)
+        print(f"Time: {time_s2c:.2f} seconds")
+        print(f"Throughput: {throughput_s2c:.2f} kbps")
+        print(f"Data integrity: {'OK' if integrity_s2c else 'FAILED'}")
+
+
+        time.sleep(1)
+        flush(client)
+        flush(server)
 
     finally:
         client.close()
@@ -135,4 +212,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
